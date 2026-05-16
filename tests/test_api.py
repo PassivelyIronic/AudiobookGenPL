@@ -50,16 +50,22 @@ def _reset_state():
 
 
 @pytest.fixture
-def test_settings(tmp_path: Path) -> Settings:
-    return Settings(
-        upload_dir=tmp_path / "uploads",
-        output_dir=tmp_path / "outputs",
-        work_dir=tmp_path / "work",
-        tts_mock_mode=True,
-        chunk_max_chars=200,
-        mp3_bitrate="64k",
-        max_upload_size_mb=10,
-    )
+def test_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    get_settings.cache_clear()
+    
+    # 1. Wymuszamy ścieżki w zmiennych środowiskowych, żeby wszystkie
+    # moduły (w tym worker Celery) pobierały katalogi testowe.
+    monkeypatch.setenv("EN_UPLOAD_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("EN_OUTPUT_DIR", str(tmp_path / "outputs"))
+    monkeypatch.setenv("EN_WORK_DIR", str(tmp_path / "work"))
+    monkeypatch.setenv("EN_TTS_MOCK_MODE", "true")
+    
+    # 2. Teraz get_settings() zbuduje i zakeczuje obiekt z naszymi ścieżkami
+    s = get_settings()
+    
+    # 3. Nadpisujemy dla FastAPI (żeby endpoints też z tego korzystały)
+    app.dependency_overrides[get_settings] = lambda: s
+    return s
 
 
 @pytest.fixture
