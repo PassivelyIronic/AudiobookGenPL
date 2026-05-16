@@ -83,7 +83,7 @@ def _init_worker(**kwargs: Any) -> None:
 # ============================================================
 
 @celery_app.task(bind=True, name="epub_narrate.process_epub")
-def process_epub_task(self, task_id: str, epub_filename: str) -> dict[str, Any]:
+def process_epub_task(self, epub_filename: str) -> dict[str, Any]:
     settings = get_settings()
     task_id = self.request.id
     epub = Path(epub_filename).resolve()
