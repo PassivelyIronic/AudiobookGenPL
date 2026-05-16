@@ -1,0 +1,39 @@
+# ============================================================
+#  Audio-Książnica - infrastruktura lokalna
+# ============================================================
+#
+#  Uruchomienie:
+#    docker compose up -d        # w tle
+#    docker compose logs -f      # śledź logi
+#    docker compose down         # zatrzymaj
+#    docker compose down -v      # zatrzymaj i wyczyść volumeny (UWAGA: kasuje
+#                                # zakolejkowane taski Celery)
+#
+#  Faza 2 obejmuje tylko Redisa - broker + result backend dla Celery.
+#  Worker Celery i FastAPI uruchamiamy na hoście (mają dostęp do GPU).
+#  W fazie 3 (konteneryzacja całości) dorzucimy serwisy `worker` i `api`
+#  z mappingiem `--gpus all` dla workera.
+
+services:
+
+  redis:
+    image: redis:7-alpine
+    container_name: audio-ksiaznica-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    # save 60 1  → zrzut RDB na dysk co 60 sek przy >=1 zmianie klucza.
+    # --loglevel warning ucina spam INFO-poziomu.
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  redis-data:
+    driver: local

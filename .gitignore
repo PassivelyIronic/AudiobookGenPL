@@ -1,0 +1,21 @@
+# Środowiska i cache Pythona
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+
+# Twoje IDE (PyCharm)
+.idea/
+
+# Konfiguracja i sekrety
+.env
+
+# Pliki wejściowe i wyjściowe aplikacji (żeby nie zapchać GitHuba)
+storage/
+*.mp3
+*.wav
+*.epub
+
+# Lokalne modele AI (na wszelki wypadek)
+tts_models/
