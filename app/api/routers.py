@@ -40,6 +40,8 @@ from app.api.schemas import (
     ConversionResultPayload,
     HealthResponse,
     ProgressInfo,
+    QueueItem,
+    QueueResponse,
     TaskStatusResponse,
     UploadResponse,
 )
@@ -207,6 +209,112 @@ async def get_task_status(task_id: str) -> TaskStatusResponse:
 
     # PENDING / STARTED - nic dodatkowego nie zwracamy.
     return response
+
+
+# ============================================================
+#  Kolejka - widok wszystkich zadań w Celery
+# ============================================================
+
+
+def _extract_epub_filename(args: list) -> str | None:
+    """
+    Bezpiecznie wyciąga nazwę pliku z pierwszego argumentu taska.
+
+    Format args z `process_epub_task.delay(str(target))`:
+        ["/storage/uploads/abc123__moja_ksiazka.epub"]
+    Zwracamy "moja_ksiazka.epub" (część po prefiksie UUID + "__").
+    """
+    if not args or not isinstance(args[0], str):
+        return None
+    try:
+        name = Path(args[0]).name
+        # Nasz prefix to "{uuid_hex}__{original_name}" - odcinamy uuid.
+        if "__" in name:
+            return name.split("__", 1)[1]
+        return name
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@router.get(
+    "/queue",
+    response_model=QueueResponse,
+    tags=["meta"],
+    summary="Lista zadań w kolejce Celery",
+    responses={
+        200: {"description": "Aktualny stan kolejki."},
+        503: {"description": "Broker Celery nieosiągalny."},
+    },
+)
+async def list_queue() -> QueueResponse:
+    """
+    Zwraca aktywne (ACTIVE) i zakolejkowane (RESERVED) zadania ze wszystkich
+    workerów. Wymaga, by Redis/broker były osiągalne - inaczej 503.
+
+    Endpoint blokujący - `inspect()` wysyła broadcast pingi do workerów
+    i czeka na odpowiedzi (timeout 2 s). Nie wołać częściej niż raz / 2-3 s.
+    """
+    inspector = celery_app.control.inspect(timeout=2.0)
+
+    # ping() zwraca {worker_name: {'ok': 'pong'}} lub None, jeśli broker
+    # nie odpowiada / brak workerów.
+    try:
+        ping_result = inspector.ping()
+    except Exception as exc:  # noqa: BLE001 - broker może być down
+        logger.warning("Nie udało się sięgnąć do brokera Celery: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Broker Celery niedostępny: {exc}",
+        ) from exc
+
+    workers_online = len(ping_result or {})
+
+    if workers_online == 0:
+        # Broker działa (ping nie rzucił), ale żaden worker nie odpowiedział.
+        # Zwracamy pustą listę, NIE 503 - klient ma wiedzieć, że workery są
+        # po prostu offline.
+        return QueueResponse(
+            items=[], workers_online=0, broker_reachable=True
+        )
+
+    active = inspector.active() or {}
+    reserved = inspector.reserved() or {}
+
+    items: list[QueueItem] = []
+    for worker_name, tasks in active.items():
+        for task in tasks:
+            items.append(
+                QueueItem(
+                    task_id=task.get("id", ""),
+                    state="ACTIVE",
+                    worker=worker_name,
+                    name=task.get("name"),
+                    epub_filename=_extract_epub_filename(task.get("args") or []),
+                    received_at=task.get("time_start"),
+                )
+            )
+
+    for worker_name, tasks in reserved.items():
+        for task in tasks:
+            items.append(
+                QueueItem(
+                    task_id=task.get("id", ""),
+                    state="RESERVED",
+                    worker=worker_name,
+                    name=task.get("name"),
+                    epub_filename=_extract_epub_filename(task.get("args") or []),
+                    received_at=task.get("time_start"),
+                )
+            )
+
+    # ACTIVE przed RESERVED, w obrębie grupy - najstarsze na górze.
+    items.sort(key=lambda i: (i.state != "ACTIVE", i.received_at or 0))
+
+    return QueueResponse(
+        items=items,
+        workers_online=workers_online,
+        broker_reachable=True,
+    )
 
 
 # ============================================================

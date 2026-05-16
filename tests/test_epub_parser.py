@@ -19,7 +19,12 @@ from pathlib import Path
 import pytest
 from ebooklib import epub
 
-from app.services.epub_parser import Chapter, EpubParser, EpubParserError
+from app.services.epub_parser import (
+    Chapter,
+    ChapterFilter,
+    EpubParser,
+    EpubParserError,
+)
 
 
 # ============================================================
@@ -268,3 +273,228 @@ class TestStrumieniowanie:
         assert isinstance(chapter, Chapter)
         with pytest.raises(Exception):  # frozen dataclass = FrozenInstanceError
             chapter.text = "podmiana"  # type: ignore[misc]
+
+
+# ============================================================
+#  Smart Parser - heurystyka pomijania śmieciowych rozdziałów
+# ============================================================
+
+
+class TestChapterFilterWhitelist:
+    """Numerowane rozdziały - whitelist wygrywa nad wszystkim innym."""
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "Rozdział 1",
+            "Rozdział I",
+            "ROZDZIAŁ XII",
+            "rozdzial 5",                  # bez diakrytyków
+            "Chapter 1",
+            "Chapter VII",
+            "Część 2",
+            "Część pierwsza",
+            "Part III",
+            "Prolog",
+            "Prologue",
+            "Epilog",
+            "Wstęp",
+            "Introduction",
+        ],
+    )
+    def test_numerowane_rozdzialy_zawsze_zostaja(self, title: str):
+        f = ChapterFilter()
+        skip, reason = f.should_skip(title, "<p>treść</p>", "treść" * 50)
+        assert skip is False, f"Whitelist powinien zachować '{title}'"
+        assert reason is None
+
+    def test_whitelist_wygrywa_z_linkami(self):
+        """Nawet jeśli rozdział 1 ma jakieś linki - to wciąż rozdział."""
+        html = "<p>Treść z " + "<a href='#'>link</a> " * 20 + "tekstem.</p>"
+        text = "Treść " + "link " * 20 + "z dodatkowymi słowami " * 10
+        f = ChapterFilter()
+        skip, _ = f.should_skip("Rozdział 1", html, text)
+        assert skip is False
+
+
+class TestChapterFilterBlacklist:
+    """Tytuły zdradzające sekcje techniczne książki."""
+
+    @pytest.mark.parametrize(
+        "title",
+        [
+            "Spis treści",
+            "Spis Treści",
+            "SPIS TREŚCI",
+            "Spis rozdziałów",
+            "Dedykacja",
+            "Podziękowania",
+            "O autorze",
+            "Nota o autorze",
+            "Bibliografia",
+            "Przypisy",
+            "Indeks",
+            "Prawa autorskie",
+            "Copyright",
+            "Table of Contents",
+            "Contents",
+            "Acknowledgments",
+            "Dedication",
+            "About the Author",
+            "Bibliography",
+            "Index",
+            "Colophon",
+            "Title Page",
+        ],
+    )
+    def test_blacklist_pomija(self, title: str):
+        f = ChapterFilter()
+        skip, reason = f.should_skip(title, "<p>treść</p>", "treść normalna " * 30)
+        assert skip is True, f"Blacklist powinien pominąć '{title}'"
+        assert reason is not None and len(reason) > 0
+
+
+class TestChapterFilterLinkDensity:
+    """Heurystyka: TOC w przebraniu - dużo linków, mało treści narracyjnej."""
+
+    def test_wysoka_gestosc_linkow_pomijana(self):
+        # 50 anchorów, każdy ~3 słowa = 150 link-words. Total ~200 słów.
+        html = (
+            "<ol>"
+            + "".join(
+                f"<li><a href='#c{i}'>Rozdział {i} pierwszy drugi</a></li>"
+                for i in range(50)
+            )
+            + "</ol>"
+        )
+        text = " ".join(f"Rozdział {i} pierwszy drugi" for i in range(50))
+        f = ChapterFilter()
+        skip, reason = f.should_skip("Bez tytułu", html, text)
+        assert skip is True
+        assert "linków" in reason
+
+    def test_niska_gestosc_linkow_zachowana(self):
+        # Akapit z 1 linkiem na ~100 słów - to normalny rozdział.
+        text = "To jest normalny rozdział z dużą ilością tekstu " * 20
+        html = f"<p>{text} Tu jest <a href='#'>jeden link</a> i nic więcej.</p>"
+        f = ChapterFilter()
+        skip, _ = f.should_skip("Rozdział narracyjny", html, text)
+        assert skip is False
+
+    def test_krotki_tekst_pomija_heurystyke_link_density(self):
+        """Dla < 30 słów heurystyka link-density jest wyłączona."""
+        html = "<p><a href='#'>Link</a> w środku krótkiego.</p>"
+        text = "Link w środku krótkiego."  # 4 słowa
+        f = ChapterFilter()
+        skip, _ = f.should_skip("Coś krótkiego", html, text)
+        # 1 link-word / 4 total = 25% - powinno by przeszło limit 30%,
+        # ale za mało słów żeby heurystyka się aktywowała.
+        assert skip is False
+
+    def test_konfigurowany_prog_link_density(self):
+        # 5 linków po 1 słowie z 50 słów = 10% density.
+        text = "słowo " * 50
+        html = "<p>" + " ".join("<a href='#'>link</a>" for _ in range(5)) + " " + text + "</p>"
+        # Z domyślnym progiem 30% - zostaje.
+        f_default = ChapterFilter()
+        skip, _ = f_default.should_skip("Coś", html, text + " link link link link link")
+        assert skip is False
+        # Z bardzo niskim progiem - pomijamy.
+        f_strict = ChapterFilter(max_link_density=0.05)
+        skip, reason = f_strict.should_skip(
+            "Coś", html, text + " link link link link link"
+        )
+        assert skip is True
+
+    def test_niepoprawny_prog_rzuca_value_error(self):
+        with pytest.raises(ValueError, match="max_link_density"):
+            ChapterFilter(max_link_density=0.0)
+        with pytest.raises(ValueError, match="max_link_density"):
+            ChapterFilter(max_link_density=1.5)
+
+
+class TestChapterFilterIntegracja:
+    """End-to-end - parser z filterem na realistycznym EPUB."""
+
+    def _make_realistic_epub(self, tmp_path: Path) -> Path:
+        """EPUB z mieszanką: TOC, copyright, normalne rozdziały, indeks."""
+        return _build_minimal_epub(
+            tmp_path,
+            [
+                # 1. TOC - pełen linków, bez słowa kluczowego w tytule
+                "<h1>Bez tytułu</h1><ol>"
+                + "".join(
+                    f"<li><a href='#c{i}'>Rozdział {i} pierwszy drugi trzeci</a></li>"
+                    for i in range(30)
+                )
+                + "</ol>",
+                # 2. Copyright - poznany po tytule
+                "<h1>Copyright</h1><p>Wszelkie prawa zastrzeżone. "
+                "Wydawnictwo XYZ 2024 oraz dodatkowy tekst dla progu.</p>",
+                # 3. Dedykacja
+                "<h1>Dedykacja</h1><p>Dla mojej żony za jej cierpliwość "
+                "i wsparcie w trakcie pisania tej książki.</p>",
+                # 4. Pierwszy prawdziwy rozdział
+                "<h1>Rozdział 1</h1><p>Pan Tadeusz wstał wcześnie rano. "
+                "Spojrzał przez okno na horyzont. Pomyślał o nadchodzącym dniu.</p>",
+                # 5. Drugi rozdział
+                "<h1>Rozdział 2</h1><p>Następnego dnia wybrał się na "
+                "spacer. Las pachniał jesienią. Liście szeleściły pod butami.</p>",
+                # 6. Przypisy
+                "<h1>Przypisy</h1><p>1. Patrz literatura przedmiotu. "
+                "2. Cytat z Norwida w tłumaczeniu autora niniejszej książki.</p>",
+                # 7. O autorze
+                "<h1>O autorze</h1><p>Jan Kowalski urodził się w 1970 "
+                "roku. Jest absolwentem polonistyki Uniwersytetu Jagiellońskiego.</p>",
+            ],
+        )
+
+    def test_realistyczny_epub_pomija_smieci_zostawia_rozdzialy(
+        self, tmp_path: Path
+    ):
+        epub_path = self._make_realistic_epub(tmp_path)
+        parser = EpubParser(epub_path)
+
+        chapters = list(parser.iter_chapters())
+
+        # Z 7 sekcji powinny zostać tylko 2 prawdziwe rozdziały.
+        assert len(chapters) == 2
+        titles = [c.title for c in chapters]
+        assert "Rozdział 1" in titles
+        assert "Rozdział 2" in titles
+        # Nie ma śmieci
+        assert not any("Copyright" in t for t in titles)
+        assert not any("Dedykacja" in t for t in titles)
+        assert not any("Przypisy" in t for t in titles)
+        assert not any("autorze" in t for t in titles)
+
+    def test_skip_garbage_False_zachowuje_wszystko(self, tmp_path: Path):
+        """Backward-compat - wyłączamy heurystykę i mamy stare zachowanie."""
+        epub_path = self._make_realistic_epub(tmp_path)
+        parser = EpubParser(epub_path)
+
+        chapters = list(parser.iter_chapters(skip_garbage=False))
+
+        # Bez heurystyki wszystkie 7 sekcji przechodzi (są wszystkie > 50 znaków).
+        assert len(chapters) == 7
+
+    def test_wlasna_instancja_chapter_filter(self, tmp_path: Path):
+        """Można podać własny filter z restrykcyjnym link-density."""
+        epub_path = self._make_realistic_epub(tmp_path)
+        parser = EpubParser(epub_path)
+
+        # Restrykcyjny filter
+        my_filter = ChapterFilter(max_link_density=0.05)
+        chapters = list(parser.iter_chapters(chapter_filter=my_filter))
+
+        # Wciąż dwa rozdziały - normalne rozdziały nie mają linków.
+        assert len(chapters) == 2
+
+    def test_indeksacja_jest_ciagla_po_skipach(self, tmp_path: Path):
+        """Po wycięciu śmieci indeksy 0..N-1 są bez dziur."""
+        epub_path = self._make_realistic_epub(tmp_path)
+        parser = EpubParser(epub_path)
+
+        chapters = list(parser.iter_chapters())
+        indices = [c.index for c in chapters]
+        assert indices == list(range(len(chapters)))

@@ -456,3 +456,170 @@ class TestDownloadBezpieczenstwo:
         r = client.get(f"/download/{fake_task_id}")
         assert r.status_code == 404
         assert "nie istnieje" in r.json()["detail"].lower()
+
+
+# ============================================================
+#  Queue endpoint - widok kolejki
+# ============================================================
+
+
+class TestQueueEndpoint:
+    """
+    Testy /queue z mockowanym `inspect()`. Nie potrzebujemy realnego
+    brokera ani workera - patchujemy `celery_app.control.inspect`.
+    """
+
+    def test_brak_workerow_zwraca_pusta_liste(
+        self, client: TestClient, monkeypatch
+    ):
+        """Broker działa, ale żaden worker nie odpowiada na ping."""
+        from app.worker import celery_app
+
+        class _FakeInspector:
+            def ping(self): return {}        # zero workerów
+            def active(self): return {}
+            def reserved(self): return {}
+
+        monkeypatch.setattr(
+            celery_app.control, "inspect",
+            lambda *a, **kw: _FakeInspector(),
+        )
+
+        r = client.get("/queue")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["items"] == []
+        assert body["workers_online"] == 0
+        assert body["broker_reachable"] is True
+
+    def test_active_i_reserved_taski_zwracane_lacznie(
+        self, client: TestClient, monkeypatch
+    ):
+        from app.worker import celery_app
+
+        class _FakeInspector:
+            def ping(self):
+                return {"celery@worker1": {"ok": "pong"}}
+            def active(self):
+                return {
+                    "celery@worker1": [
+                        {
+                            "id": "aaa-111",
+                            "name": "audio_ksiaznica.process_epub",
+                            "args": ["/storage/uploads/uuid__moja_ksiazka.epub"],
+                            "time_start": 1700000000.5,
+                        }
+                    ]
+                }
+            def reserved(self):
+                return {
+                    "celery@worker1": [
+                        {
+                            "id": "bbb-222",
+                            "name": "audio_ksiaznica.process_epub",
+                            "args": ["/storage/uploads/uuid__druga.epub"],
+                            "time_start": None,
+                        }
+                    ]
+                }
+
+        monkeypatch.setattr(
+            celery_app.control, "inspect",
+            lambda *a, **kw: _FakeInspector(),
+        )
+
+        r = client.get("/queue")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["workers_online"] == 1
+        assert body["broker_reachable"] is True
+        assert len(body["items"]) == 2
+
+        # ACTIVE musi być przed RESERVED
+        states = [item["state"] for item in body["items"]]
+        assert states == ["ACTIVE", "RESERVED"]
+
+        # Wydedukowane nazwy plików
+        filenames = [item["epub_filename"] for item in body["items"]]
+        assert "moja_ksiazka.epub" in filenames
+        assert "druga.epub" in filenames
+
+    def test_broker_niedostepny_zwraca_503(
+        self, client: TestClient, monkeypatch
+    ):
+        from app.worker import celery_app
+
+        class _DeadInspector:
+            def ping(self):
+                raise ConnectionError("Connection refused (Redis down)")
+
+        monkeypatch.setattr(
+            celery_app.control, "inspect",
+            lambda *a, **kw: _DeadInspector(),
+        )
+
+        r = client.get("/queue")
+        assert r.status_code == 503
+        assert "broker" in r.json()["detail"].lower()
+
+    def test_nazwa_pliku_bez_prefiksu_uuid(
+        self, client: TestClient, monkeypatch
+    ):
+        """Jeśli args nie ma UUID-prefiksu, zwracamy całą nazwę."""
+        from app.worker import celery_app
+
+        class _FakeInspector:
+            def ping(self):
+                return {"celery@w1": {"ok": "pong"}}
+            def active(self):
+                return {
+                    "celery@w1": [
+                        {
+                            "id": "z-1",
+                            "name": "audio_ksiaznica.process_epub",
+                            "args": ["/somewhere/legacy_name.epub"],
+                        }
+                    ]
+                }
+            def reserved(self): return {}
+
+        monkeypatch.setattr(
+            celery_app.control, "inspect",
+            lambda *a, **kw: _FakeInspector(),
+        )
+
+        r = client.get("/queue")
+        body = r.json()
+        assert body["items"][0]["epub_filename"] == "legacy_name.epub"
+
+    def test_uszkodzone_args_nie_psuja_endpointu(
+        self, client: TestClient, monkeypatch
+    ):
+        """Defensywnie - jak args jest pusty/None/dziwnego typu, nie pada."""
+        from app.worker import celery_app
+
+        class _FakeInspector:
+            def ping(self):
+                return {"celery@w1": {"ok": "pong"}}
+            def active(self):
+                return {
+                    "celery@w1": [
+                        {"id": "1", "name": "task", "args": []},
+                        {"id": "2", "name": "task", "args": None},
+                        {"id": "3", "name": "task", "args": [None]},
+                        {"id": "4", "name": "task"},  # bez args
+                    ]
+                }
+            def reserved(self): return {}
+
+        monkeypatch.setattr(
+            celery_app.control, "inspect",
+            lambda *a, **kw: _FakeInspector(),
+        )
+
+        r = client.get("/queue")
+        assert r.status_code == 200
+        body = r.json()
+        assert len(body["items"]) == 4
+        for item in body["items"]:
+            assert item["epub_filename"] is None

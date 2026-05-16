@@ -62,3 +62,49 @@ class HealthResponse(BaseModel):
     status: Literal["ok", "degraded"] = "ok"
     service: str = "audio-ksiaznica"
     version: str = "0.2.0"
+
+
+# ============================================================
+#  Kolejka zadań - widok administratora
+# ============================================================
+
+
+QueueState = Literal["ACTIVE", "RESERVED"]
+
+
+class QueueItem(BaseModel):
+    """Pojedyncze zadanie w kolejce Celery."""
+
+    task_id: str = Field(..., description="Identyfikator zadania")
+    state: QueueState = Field(
+        ...,
+        description=(
+            "ACTIVE = aktualnie przetwarzane przez workera, "
+            "RESERVED = zakolejkowane, czeka na slot"
+        ),
+    )
+    worker: str | None = Field(
+        None, description="Nazwa workera, który przejął zadanie"
+    )
+    name: str | None = Field(
+        None, description="Nazwa funkcji taska", examples=["audio_ksiaznica.process_epub"]
+    )
+    epub_filename: str | None = Field(
+        None,
+        description="Nazwa wgranego pliku EPUB (jeśli da się wydedukować z args)",
+    )
+    received_at: float | None = Field(
+        None, description="Unix timestamp odebrania przez workera"
+    )
+
+
+class QueueResponse(BaseModel):
+    """Odpowiedź endpointu /queue."""
+
+    items: list[QueueItem] = Field(default_factory=list)
+    workers_online: int = Field(
+        0, ge=0, description="Liczba workerów Celery odpowiadających na ping"
+    )
+    broker_reachable: bool = Field(
+        True, description="Czy backend Celery (Redis) jest osiągalny"
+    )

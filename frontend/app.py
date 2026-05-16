@@ -314,6 +314,91 @@ def reset_ui() -> tuple[None, None, str]:
 
 
 # ============================================================
+#  Kolejka - pobieranie stanu z /queue
+# ============================================================
+
+
+def _format_received_at(ts: float | None) -> str:
+    """Unix timestamp -> 'HH:MM:SS' (lokalny czas) albo '-'."""
+    if not ts:
+        return "—"
+    try:
+        from datetime import datetime
+        return datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+    except Exception:  # noqa: BLE001
+        return "—"
+
+
+# Etykiety stanów dla UI - emoji + nazwa
+_QUEUE_STATE_LABELS: dict[str, str] = {
+    "ACTIVE": "🟢 Przetwarzanie",
+    "RESERVED": "⏳ W kolejce",
+}
+
+
+def fetch_queue(api_url: str) -> tuple[list[list[str]], str]:
+    """
+    Odpytuje /queue i zwraca dane do wyświetlenia w Gradio Dataframe.
+
+    Returns:
+        (rows, summary_markdown) - rows to lista wierszy dla gr.Dataframe,
+        summary_markdown to krótki opis nad tabelą.
+    """
+    api_url = (api_url or DEFAULT_API_URL).rstrip("/")
+
+    try:
+        r = httpx.get(f"{api_url}/queue", timeout=5.0)
+    except httpx.RequestError as exc:
+        return (
+            [],
+            f"❌ **Brak połączenia z API** (`{api_url}`)\n\n```\n{exc}\n```",
+        )
+
+    if r.status_code == 503:
+        try:
+            detail = r.json().get("detail", "broker offline")
+        except Exception:
+            detail = "broker offline"
+        return [], f"⚠️ **Broker Celery niedostępny:** {detail}"
+
+    if r.status_code != 200:
+        return [], _format_api_error(r)
+
+    body = r.json()
+    workers = body.get("workers_online", 0)
+    items = body.get("items", [])
+
+    if workers == 0:
+        summary = (
+            "💤 **Brak workerów online.** Uruchom `celery -A app.worker.celery_app worker`."
+        )
+    elif not items:
+        summary = (
+            f"😴 **Kolejka pusta** — {workers} worker(ów) gotowych na zadania."
+        )
+    else:
+        active = sum(1 for i in items if i["state"] == "ACTIVE")
+        reserved = sum(1 for i in items if i["state"] == "RESERVED")
+        summary = (
+            f"### 📋 W kolejce: **{len(items)}** zadań  \n"
+            f"🟢 Przetwarzanych: **{active}** · "
+            f"⏳ Oczekujących: **{reserved}** · "
+            f"👷 Workerów online: **{workers}**"
+        )
+
+    rows = []
+    for item in items:
+        rows.append([
+            _QUEUE_STATE_LABELS.get(item["state"], item["state"]),
+            item.get("epub_filename") or "—",
+            item["task_id"][:8] + "…",
+            item.get("worker") or "—",
+            _format_received_at(item.get("received_at")),
+        ])
+    return rows, summary
+
+
+# ============================================================
 #  Layout
 # ============================================================
 
@@ -336,51 +421,100 @@ def build_ui() -> gr.Blocks:
         gr.Markdown("# 📚 Audio-Książnica")
         gr.Markdown(_DESCRIPTION_MD)
 
-        with gr.Row(equal_height=False):
-            # ----- Kolumna konfiguracji -----
-            with gr.Column(scale=2):
-                gr.Markdown("### ⚙️ Konfiguracja")
-                api_url_input = gr.Textbox(
-                    label="URL backendu FastAPI",
-                    value=DEFAULT_API_URL,
-                    placeholder="http://localhost:8000",
-                    info="Adres działającej instancji backendu.",
+        # URL backendu jest WSPÓLNY dla obu zakładek - trzymamy go nad
+        # zakładkami, żeby zmiana w jednym miejscu propagowała się
+        # do drugiej zakładki.
+        api_url_input = gr.Textbox(
+            label="URL backendu FastAPI",
+            value=DEFAULT_API_URL,
+            placeholder="http://localhost:8000",
+            info="Adres działającej instancji backendu (Redis + Celery + FastAPI).",
+        )
+
+        with gr.Tabs():
+            # ============================================================
+            #  Zakładka 1: Konwersja
+            # ============================================================
+            with gr.Tab("🎙️ Konwersja"):
+                with gr.Row(equal_height=False):
+                    # ----- Kolumna konfiguracji -----
+                    with gr.Column(scale=2):
+                        gr.Markdown("### 📥 Wgraj plik")
+                        file_input = gr.File(
+                            label="Plik EPUB",
+                            file_types=[".epub"],
+                            type="filepath",
+                            file_count="single",
+                        )
+                        with gr.Row():
+                            convert_btn = gr.Button(
+                                "🎙️ Konwertuj do MP3",
+                                variant="primary",
+                                size="lg",
+                                scale=2,
+                            )
+                            reset_btn = gr.Button("🧹 Wyczyść", size="lg", scale=1)
+
+                    # ----- Kolumna wyniku -----
+                    with gr.Column(scale=3):
+                        gr.Markdown("### 📡 Status konwersji")
+                        status_md = gr.Markdown(
+                            "👋 **Witaj!** Wgraj plik EPUB i kliknij \"Konwertuj\".",
+                        )
+                        gr.Markdown("### 🎧 Audiobook")
+                        audio_output = gr.Audio(
+                            label="Wynik konwersji",
+                            type="filepath",
+                            interactive=False,
+                        )
+
+            # ============================================================
+            #  Zakładka 2: Kolejka - widok wszystkich tasków
+            # ============================================================
+            with gr.Tab("📋 Kolejka"):
+                gr.Markdown(
+                    "Lista aktywnie przetwarzanych i oczekujących zadań. "
+                    "Odświeża się automatycznie co 5 sekund."
                 )
-                file_input = gr.File(
-                    label="📥 Plik EPUB",
-                    file_types=[".epub"],
-                    type="filepath",
-                    file_count="single",
+                queue_summary = gr.Markdown(
+                    "⏳ Ładowanie...",
+                )
+                queue_table = gr.Dataframe(
+                    headers=["Status", "Plik", "Task ID", "Worker", "Start"],
+                    datatype=["str", "str", "str", "str", "str"],
+                    interactive=False,
+                    wrap=True,
+                    label="Zadania",
                 )
                 with gr.Row():
-                    convert_btn = gr.Button(
-                        "🎙️ Konwertuj do MP3",
-                        variant="primary",
-                        size="lg",
-                        scale=2,
-                    )
-                    reset_btn = gr.Button("🧹 Wyczyść", size="lg", scale=1)
+                    refresh_btn = gr.Button("🔄 Odśwież ręcznie", size="sm")
 
-            # ----- Kolumna wyniku -----
-            with gr.Column(scale=3):
-                gr.Markdown("### 📡 Status konwersji")
-                status_md = gr.Markdown(
-                    "👋 **Witaj!** Wgraj plik EPUB i kliknij \"Konwertuj\".",
+                # Auto-refresh co 5 s przez Timer + ręczny refresh przyciskiem.
+                queue_timer = gr.Timer(value=5.0, active=True)
+                queue_timer.tick(
+                    fn=fetch_queue,
+                    inputs=[api_url_input],
+                    outputs=[queue_table, queue_summary],
                 )
-                gr.Markdown("### 🎧 Audiobook")
-                audio_output = gr.Audio(
-                    label="Wynik konwersji",
-                    type="filepath",
-                    interactive=False,
+                refresh_btn.click(
+                    fn=fetch_queue,
+                    inputs=[api_url_input],
+                    outputs=[queue_table, queue_summary],
+                )
+                # Pierwsze załadowanie - przy starcie demo, nie na timer.
+                demo.load(
+                    fn=fetch_queue,
+                    inputs=[api_url_input],
+                    outputs=[queue_table, queue_summary],
                 )
 
         gr.Markdown(
-            "<sub>Domyślnie backend pracuje w trybie `mock_mode=true` — "
-            "wygenerowane MP3 to sinusoida 440 Hz proporcjonalna do tekstu, "
-            "nie prawdziwa mowa. Pełen TTS odkomentowujemy w fazie produkcyjnej.</sub>"
+            "<sub>Wskazówka: jeśli planujesz wrzucić kilka książek pod rząd, "
+            "kolejka pokaże ci status każdej po kolei. "
+            "Worker przetwarza po jednym tasku naraz (concurrency=1).</sub>"
         )
 
-        # ----- Event bindings -----
+        # ----- Event bindings dla zakładki Konwersja -----
         convert_btn.click(
             fn=convert_epub,
             inputs=[file_input, api_url_input],

@@ -18,7 +18,7 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import Final, Iterator
 
 from bs4 import BeautifulSoup
 from ebooklib import ITEM_DOCUMENT, epub
@@ -46,6 +46,123 @@ class Chapter:
 
     def __len__(self) -> int:
         return len(self.text)
+
+
+# --- Heurystyka filtrowania śmieciowych rozdziałów ---------------------------
+
+
+class ChapterFilter:
+    """
+    Decyduje, czy rozdział jest "śmieciowy" (TOC, copyright, dedykacja, etc.)
+    i powinien zostać pominięty w syntezie audio.
+
+    Strategia od najwęższego do najszerszego sygnału:
+        1. WHITELIST (zawsze zachowaj) - tytuły matchujące wzorzec rozdziału
+           numerowanego ("Rozdział 5", "Chapter VII", "Część II"). Numer to
+           bardzo mocny sygnał, że to TREŚĆ.
+        2. BLACKLIST po słowie kluczowym w tytule - znane wzorce stron
+           technicznych książki.
+        3. LINK-DENSITY heurystyka - rozdziały, w których > 30% słów to
+           anchor text, to praktycznie zawsze TOC (każda pozycja = link).
+
+    Implementacja jest świadomie zachowawcza: w razie wątpliwości
+    ZACHOWUJEMY rozdział - lepiej zsyntezować copyright (10 sekund audio)
+    niż wyciąć prawdziwy rozdział.
+    """
+
+    # Wzorzec: "Rozdział 5", "Chapter VII", "Część 2", "Prolog" (case-insensitive).
+    # Lookbehind dla \b nie działa w Pythonie, więc strażnik na początku
+    # poprzez `^\s*`. Akceptujemy cyfry arabskie I rzymskie.
+    _ALWAYS_KEEP_RE: Final[re.Pattern[str]] = re.compile(
+        r"^\s*("
+        r"rozdział|rozdzial|chapter|część|czesc|part|book|tom|"
+        r"prolog|prologue|epilog|epilogue|wstęp|wstep|introduction"
+        r")\s*"
+        r"([\divxlcmIVXLCM]+|pierwszy|drugi|trzeci|czwarty|piąty|"
+        r"first|second|third|fourth|fifth)?",
+        re.IGNORECASE | re.UNICODE,
+    )
+
+    # Słowa kluczowe w tytule, których obecność = pomijamy (chyba że
+    # ALWAYS_KEEP też matchnęło - whitelist wygrywa).
+    _BLACKLIST_KEYWORDS: Final[frozenset[str]] = frozenset({
+        # Polski
+        "spis treści", "spis tresci", "spis rozdziałów", "spis rozdzialow",
+        "dedykacja", "podziękowania", "podziekowania", "o autorze",
+        "o autorce", "nota o autorze", "przypisy", "indeks", "skorowidz",
+        "bibliografia", "literatura", "strona tytułowa", "strona tytulowa",
+        "metryczka", "prawa autorskie", "copyright", "kolofon", "stopka",
+        # Angielski (część książek polskich ma sekcje angielskie)
+        "table of contents", "contents", "toc", "acknowledgments",
+        "acknowledgements", "dedication", "about the author", "about author",
+        "notes", "endnotes", "footnotes", "bibliography", "references",
+        "index", "colophon", "imprint", "title page", "halftitle",
+        "front matter", "back matter",
+    })
+
+    DEFAULT_MAX_LINK_DENSITY: Final[float] = 0.30
+    # Minimum słów żeby w ogóle stosować heurystykę link-density (dla 5-słowowego
+    # rozdziału jeden link = 20%, ale to bez sensu liczyć).
+    _LINK_DENSITY_MIN_WORDS: Final[int] = 30
+
+    def __init__(self, max_link_density: float = DEFAULT_MAX_LINK_DENSITY) -> None:
+        if not 0.0 < max_link_density <= 1.0:
+            raise ValueError(
+                f"max_link_density musi być w (0, 1], otrzymano {max_link_density}"
+            )
+        self._max_link_density = max_link_density
+
+    def should_skip(
+        self, title: str, html: str, text: str
+    ) -> tuple[bool, str | None]:
+        """
+        Czy ten rozdział pominąć?
+
+        Returns:
+            (skip, reason) - jeśli `skip=True`, `reason` jest niepustym
+            stringiem nadającym się do zalogowania.
+        """
+        title_norm = title.lower().strip()
+
+        # 1. WHITELIST - rozdział numerowany ZAWSZE zostaje.
+        if self._ALWAYS_KEEP_RE.match(title_norm):
+            return False, None
+
+        # 2. BLACKLIST - słowa kluczowe w tytule.
+        for keyword in self._BLACKLIST_KEYWORDS:
+            if keyword in title_norm:
+                return True, f"tytuł sugeruje sekcję techniczną ('{keyword}')"
+
+        # 3. LINK-DENSITY - heurystyka na podstawie struktury HTML.
+        density = self._compute_link_density(html, text)
+        if density > self._max_link_density:
+            return True, f"za wysoka gęstość linków ({density:.0%})"
+
+        return False, None
+
+    def _compute_link_density(self, html: str, text: str) -> float:
+        """
+        Oblicza, jaki procent słów w rozdziale to anchor text.
+
+        Działa na surowym HTML (przed _clean_html), żeby tagi <a> były
+        jeszcze obecne. Zwraca 0.0 dla zbyt krótkich tekstów (poniżej
+        progu sensowności).
+        """
+        total_words = len(text.split())
+        if total_words < self._LINK_DENSITY_MIN_WORDS:
+            return 0.0
+
+        try:
+            soup = BeautifulSoup(html, "lxml")
+        except Exception:  # noqa: BLE001 - lxml rzadko, ale potrafi
+            return 0.0
+
+        link_words = 0
+        for anchor in soup.find_all("a"):
+            link_text = anchor.get_text(separator=" ", strip=True)
+            link_words += len(link_text.split())
+
+        return link_words / total_words
 
 
 # --- Parser ------------------------------------------------------------------
@@ -91,7 +208,12 @@ class EpubParser:
 
     # ----- API publiczne -----------------------------------------------------
 
-    def iter_chapters(self, min_chars: int = 50) -> Iterator[Chapter]:
+    def iter_chapters(
+        self,
+        min_chars: int = 50,
+        skip_garbage: bool = True,
+        chapter_filter: ChapterFilter | None = None,
+    ) -> Iterator[Chapter]:
         """
         Generator zwracający kolejne rozdziały książki.
 
@@ -99,6 +221,12 @@ class EpubParser:
             min_chars: minimalna długość tekstu rozdziału, by trafił do
                 wyjścia. Krótsze fragmenty (strony tytułowe, copyright,
                 spis treści) są pomijane.
+            skip_garbage: czy pomijać śmieciowe rozdziały (TOC, dedykacje,
+                copyright itp.) na podstawie heurystyki ChapterFilter.
+                Domyślnie True - oszczędza godziny syntezy TTS.
+            chapter_filter: opcjonalna własna instancja ChapterFilter
+                (np. z innym progiem link-density). Domyślnie tworzymy
+                z defaultami.
 
         Yields:
             Chapter: rozdział z indeksem, tytułem i czystym tekstem.
@@ -106,6 +234,11 @@ class EpubParser:
         Raises:
             EpubParserError: gdy biblioteka nie zdoła otworzyć pliku.
         """
+        if skip_garbage and chapter_filter is None:
+            chapter_filter = ChapterFilter()
+        elif not skip_garbage:
+            chapter_filter = None
+
         try:
             book = epub.read_epub(str(self._path))
         except Exception as exc:  # ebooklib rzuca różnymi wyjątkami
@@ -140,6 +273,18 @@ class EpubParser:
                 continue
 
             title = self._extract_title(raw_html) or f"Rozdział {idx + 1}"
+
+            # Heurystyka anty-śmieciowa
+            if chapter_filter is not None:
+                should_skip, reason = chapter_filter.should_skip(
+                    title, raw_html, text
+                )
+                if should_skip:
+                    logger.info(
+                        "Pomijam śmieciowy rozdział '%s' (%s)", title, reason
+                    )
+                    continue
+
             yield Chapter(index=idx, title=title, text=text)
             idx += 1
 
