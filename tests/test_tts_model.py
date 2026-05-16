@@ -265,12 +265,3 @@ class TestTrybProdukcyjny:
         )
         with pytest.raises(TTSModelError, match="referencyjnego"):
             model.load()
-
-    def test_load_real_jest_jeszcze_stubem(self, tmp_path: Path):
-        """Jak długo nie odkomentujemy produkcyjnego kodu, load() rzuca
-        sensowny błąd z instrukcją co zrobić."""
-        speaker = tmp_path / "speaker.wav"
-        speaker.write_bytes(b"fake-wav-bytes")
-        model = TTSModel(mock_mode=False, speaker_wav=speaker)
-        with pytest.raises(TTSModelError, match="Odkomentuj"):
-            model.load()

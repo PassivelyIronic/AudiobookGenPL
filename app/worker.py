@@ -44,9 +44,9 @@ logger = get_task_logger(__name__)
 _settings = get_settings()
 
 celery_app = Celery(
-    "audio_ksiaznica",
-    broker=_settings.redis_url,
-    backend=_settings.redis_url,
+    "epub_narrate",
+    broker=settings.celery_broker_url,
+    backend=settings.celery_result_backend,
 )
 
 celery_app.conf.update(
@@ -115,14 +115,8 @@ def _init_worker(**kwargs: Any) -> None:
 # ============================================================
 
 
-@celery_app.task(
-    bind=True,
-    name="audio_ksiaznica.process_epub",
-    # Nie retry'ujemy automatycznie - błędy parsowania / TTS są zwykle
-    # deterministyczne i ponowna próba niczego nie zmieni.
-    autoretry_for=(),
-)
-def process_epub_task(self, epub_path: str) -> dict[str, Any]:  # noqa: D401
+@celery_app.task(bind=True, name="epub_narrate.process_epub") # Było audio_ksiaznica...
+def process_epub_task(self, task_id: str, epub_filename: str) -> dict[str, Any]:
     """
     Konwertuje EPUB do MP3.
 

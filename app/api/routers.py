@@ -114,31 +114,33 @@ async def upload_epub(
     # ----- streaming na dysk z walidacją rozmiaru -----
     max_bytes = settings.max_upload_size_mb * 1024 * 1024
     written = 0
+    is_oversized = False
+
     try:
         async with aiofiles.open(target, "wb") as out:
             while chunk := await file.read(_UPLOAD_CHUNK_SIZE):
                 written += len(chunk)
                 if written > max_bytes:
-                    # Przerywamy zapis i kasujemy częściowy plik.
-                    await out.flush()
-                    target.unlink(missing_ok=True)
-                    raise HTTPException(
-                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                        detail=(
-                            f"Plik przekracza limit "
-                            f"{settings.max_upload_size_mb} MB."
-                        ),
-                    )
+                    is_oversized = True
+                    break  # Wychodzimy z pętli i zamykamy plik
                 await out.write(chunk)
-    except HTTPException:
-        raise
-    except OSError as exc:
-        target.unlink(missing_ok=True)
-        logger.exception("Błąd zapisu uploadu")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Nie udało się zapisać uploadu: {exc}",
-        ) from exc
+                
+        # Plik jest już zamknięty, Windows pozwoli go usunąć
+        if is_oversized:
+            target.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Plik przekracza limit {settings.max_upload_size_mb} MB.",
+            )
+    except Exception as exc:
+        if not isinstance(exc, HTTPException):
+            target.unlink(missing_ok=True)
+            logger.exception("Błąd zapisu uploadu")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Nie udało się zapisać uploadu: {exc}",
+            ) from exc
+        raise  # <--- TUTAJ TYLKO SAMO "raise", żeby przepuścić błąd 413!
 
     if written == 0:
         target.unlink(missing_ok=True)

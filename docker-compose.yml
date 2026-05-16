@@ -1,39 +1,62 @@
-# ============================================================
-#  Audio-Książnica - infrastruktura lokalna
-# ============================================================
-#
-#  Uruchomienie:
-#    docker compose up -d        # w tle
-#    docker compose logs -f      # śledź logi
-#    docker compose down         # zatrzymaj
-#    docker compose down -v      # zatrzymaj i wyczyść volumeny (UWAGA: kasuje
-#                                # zakolejkowane taski Celery)
-#
-#  Faza 2 obejmuje tylko Redisa - broker + result backend dla Celery.
-#  Worker Celery i FastAPI uruchamiamy na hoście (mają dostęp do GPU).
-#  W fazie 3 (konteneryzacja całości) dorzucimy serwisy `worker` i `api`
-#  z mappingiem `--gpus all` dla workera.
+version: '3.8'
 
 services:
-
   redis:
-    image: redis:7-alpine
-    container_name: audio-ksiaznica-redis
-    restart: unless-stopped
+    image: redis:7.4-alpine
+    container_name: epub_narrate_redis
     ports:
       - "6379:6379"
     volumes:
-      - redis-data:/data
-    # save 60 1  → zrzut RDB na dysk co 60 sek przy >=1 zmianie klucza.
-    # --loglevel warning ucina spam INFO-poziomu.
-    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
-      retries: 5
-      start_period: 5s
+      retries: 3
+
+  api:
+    build: .
+    container_name: epub_narrate_api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./storage:/app/storage
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    container_name: epub_narrate_worker
+    command: celery -A app.worker.celery_app worker --loglevel=info --concurrency=1
+    env_file:
+      - .env
+    volumes:
+      - ./storage:/app/storage
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  ui:
+    build: .
+    container_name: epub_narrate_ui
+    command: python frontend/app.py
+    ports:
+      - "7860:7860"
+    env_file:
+      - .env
+    depends_on:
+      - api
 
 volumes:
-  redis-data:
-    driver: local
+  redis_data:
