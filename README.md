@@ -19,4 +19,8 @@ EpubNarrate is a self-hosted, asynchronous pipeline (FastAPI + Celery + Redis + 
 2. Place your reference voice sample (e.g., `lektor.wav`) in the project root.
 3. Run the stack:
    ```bash
+<<<<<<< HEAD
    docker compose up -d
+=======
+   docker compose up -d
+>>>>>>> dc8eb1acd09527a2bdb88d62624529dbd9f72462
