@@ -60,7 +60,7 @@ class TaskStatusResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: Literal["ok", "degraded"] = "ok"
-    service: str = "audio-ksiaznica"
+    service: str = "epub_narrate"
     version: str = "0.2.0"
 
 
@@ -87,7 +87,7 @@ class QueueItem(BaseModel):
         None, description="Nazwa workera, który przejął zadanie"
     )
     name: str | None = Field(
-        None, description="Nazwa funkcji taska", examples=["audio_ksiaznica.process_epub"]
+        None, description="Nazwa funkcji taska", examples=["epub_narrate.process_epub"]
     )
     epub_filename: str | None = Field(
         None,

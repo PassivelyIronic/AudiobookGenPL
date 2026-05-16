@@ -153,8 +153,8 @@ class ChapterFilter:
             return 0.0
 
         try:
-            soup = BeautifulSoup(html, "lxml")
-        except Exception:  # noqa: BLE001 - lxml rzadko, ale potrafi
+            soup = BeautifulSoup(html, "lxml-xml") # bylo BeautifulSoup(html, "lxml")
+        except Exception:  # lub BeautifulSoup(html, "xml")
             return 0.0
 
         link_words = 0
