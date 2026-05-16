@@ -53,17 +53,17 @@ def _reset_state():
 def test_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     get_settings.cache_clear()
     
-    # 1. Wymuszamy ścieżki w zmiennych środowiskowych, żeby wszystkie
-    # moduły (w tym worker Celery) pobierały katalogi testowe.
+    # 1. Wymuszamy ścieżki i ustawienia w zmiennych środowiskowych
     monkeypatch.setenv("EN_UPLOAD_DIR", str(tmp_path / "uploads"))
     monkeypatch.setenv("EN_OUTPUT_DIR", str(tmp_path / "outputs"))
     monkeypatch.setenv("EN_WORK_DIR", str(tmp_path / "work"))
     monkeypatch.setenv("EN_TTS_MOCK_MODE", "true")
+    monkeypatch.setenv("EN_MAX_UPLOAD_SIZE_MB", "10")  # <--- ZGUBIONY LIMIT 10 MB!
     
-    # 2. Teraz get_settings() zbuduje i zakeczuje obiekt z naszymi ścieżkami
+    # 2. Teraz get_settings() zbuduje i zakeczuje obiekt
     s = get_settings()
     
-    # 3. Nadpisujemy dla FastAPI (żeby endpoints też z tego korzystały)
+    # 3. Nadpisujemy dla FastAPI
     app.dependency_overrides[get_settings] = lambda: s
     return s
 
