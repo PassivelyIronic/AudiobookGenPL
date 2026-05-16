@@ -45,8 +45,8 @@ _settings = get_settings()
 
 celery_app = Celery(
     "epub_narrate",
-    broker=settings.celery_broker_url,
-    backend=settings.celery_result_backend,
+    broker=_settings.celery_broker_url,
+    backend=_settings.celery_result_backend,
 )
 
 celery_app.conf.update(
